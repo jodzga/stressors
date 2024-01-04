@@ -18,12 +18,15 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"databricks.com/cpuhist/histutils"
 	"databricks.com/cpuhist/randutils"
 )
 
 var (
+	mode                            string
+	diskPath                        string
 	frequency                       int
 	displaySeconds                  int
 	histogram                       *histutils.Histogram
@@ -74,6 +77,8 @@ type Worker struct {
 }
 
 func init() {
+	flag.StringVar(&mode, "m", "cpu", "Mode (cpu or disk)")
+	flag.StringVar(&diskPath, "dp", "/tmp", "Path to write files to for disk mode")
 	flag.IntVar(&frequency, "f", 27, "Frequency to read /proc/stat")
 	flag.IntVar(&displaySeconds, "d", 1, "Interval to emit histogram in seconds")
 	flag.Float64Var(&rate, "r", 100, "Rate of work to schedule in Hz (work per second) - Poisson distribution")
@@ -99,6 +104,8 @@ func main() {
 	flag.Parse()
 
 	// print out all the parameters
+	fmt.Printf("mode: %s\n", mode)
+	fmt.Printf("diskPath: %s\n", diskPath)
 	fmt.Printf("frequency: %d\n", frequency)
 	fmt.Printf("displaySeconds: %d\n", displaySeconds)
 	fmt.Printf("rate: %f\n", rate)
@@ -119,96 +126,175 @@ func main() {
 	fmt.Printf("maxWork: %f\n", maxWork)
 	fmt.Printf("finalSleepTime: %s\n", finalSleepTime)
 
-	paretoAvg = xm * alpha / (alpha - 1)
+	if mode == "disk" {
+		fmt.Printf("Disk mode\n")
 
-	// initialize work sheet with 10MB of random data
-	workSheet = make([]byte, 10000000)
-	rand.Read(workSheet)
+		testFile := diskPath + "/test_file"
 
-	// initialize X and Y for linear regression with empty arrays
-	X = make([]float64, regressionHistoryLength)
-	Y = make([]float64, regressionHistoryLength)
+		createLargeFile(testFile)
 
-	rand.Seed(time.Now().UnixNano())
+		// Memory-map the file
 
-	numCPU = float64(runtime.NumCPU())
-	if maxWorkParallelism == 0 || maxWorkParallelism > int(numCPU) {
-		maxWorkParallelism = int(numCPU)
+		modifyMappedFile(testFile)
+
+	} else if mode == "cpu" {
+		fmt.Printf("CPU mode\n")
+
+		paretoAvg = xm * alpha / (alpha - 1)
+
+		// initialize work sheet with 10MB of random data
+		workSheet = make([]byte, 10000000)
+		rand.Read(workSheet)
+
+		// initialize X and Y for linear regression with empty arrays
+		X = make([]float64, regressionHistoryLength)
+		Y = make([]float64, regressionHistoryLength)
+
+		rand.Seed(time.Now().UnixNano())
+
+		numCPU = float64(runtime.NumCPU())
+		if maxWorkParallelism == 0 || maxWorkParallelism > int(numCPU) {
+			maxWorkParallelism = int(numCPU)
+		}
+
+		histogram = histutils.NewHistogram("equal", 1.0, 100.0)
+		totalCPUHistogram = histutils.NewHistogram("equal", 1.0, 100.0)
+
+		totalWorkHistogram = histutils.NewHistogram("exponential", 2.0, 1e9)
+
+		// Create a done channel to signal workers to stop
+		done := make(chan struct{})
+
+		go updateCPUHistogram(done)
+
+		var cpuSummaryWg sync.WaitGroup
+		cpuSummaryWg.Add(1)
+		go updateCPUSummary(done, &cpuSummaryWg)
+
+		// Create the channel for the messages
+		// Buffer size set to handle worse-case scenario
+		bufferSize := int(math.Ceil(1.5 * numCPU * rate * GENERATE_REQUESTS_INTERVAL.Seconds()))
+		c := make(chan WorkItem, bufferSize)
+		go scheduleWork(rate, c, done)
+
+		// make sure we use all available CPUs
+		runtime.GOMAXPROCS(int(numCPU))
+
+		// Create a WaitGroup to wait for all the workers to finish
+		var wg sync.WaitGroup
+
+		workers := make([]*Worker, int(numCPU))
+
+		// Start the workers
+		for i := 0; i < int(numCPU); i++ {
+			workers[i] = &Worker{histutils.NewHistogram("exponential", 2.0, 1e9)}
+			wg.Add(1)
+			go worker(i, c, &wg, workers[i].workHistogram)
+		}
+
+		// Setup signal catching
+		sc := make(chan os.Signal, 1)
+		signal.Notify(sc, os.Interrupt, syscall.SIGTERM)
+
+		// Wait for an interrupt
+		sig := <-sc
+
+		log.Printf("Received signal: %v\n", sig)
+
+		// Tell work generator to stop, it will also close work channel
+		close(done)
+
+		// Wait for all workers to finish
+		log.Printf("Waiting for workers to finish\n")
+		wg.Wait()
+
+		log.Printf("Writing work histogram\n")
+		// write total work histogram to file
+		mtx2.Lock()
+		totalWorkHistogram.WriteToCSV(workHistogramOutputFilenema)
+		mtx2.Unlock()
+
+		log.Printf("Writing CPU Summary worker to finish\n")
+		cpuSummaryWg.Wait()
+
+		log.Printf("Writing CPU Summary histogram\n")
+		totalCPUHistogram.WriteToCSV(cpuHistogramOutputFilenema)
+
+		log.Printf("Compressing csv files\n")
+		files := []string{"total_work_histogram.csv", "total_cpu_histogram.csv", "per_cpu_utilization.csv", "cpu_utilization.csv", "cpu_samples.csv"}
+		err := tarballFiles(files, "files.tar.gz")
+		if err != nil {
+			panic(err)
+		}
+
+		// Sleep to allow for CPU profile to be collected
+		log.Printf("Sleeping for %v to allow for CPU profile to be collected\n", finalSleepTime)
+		time.Sleep(finalSleepTime)
 	}
+}
 
-	histogram = histutils.NewHistogram("equal", 1.0, 100.0)
-	totalCPUHistogram = histutils.NewHistogram("equal", 1.0, 100.0)
+func modifyMappedFile(filePath string) {
+	const syncEvery = 1000
+	const modificationSize = 4096 // Size of each modification
 
-	totalWorkHistogram = histutils.NewHistogram("exponential", 2.0, 1e9)
-
-	// Create a done channel to signal workers to stop
-	done := make(chan struct{})
-
-	go updateCPUHistogram(done)
-
-	var cpuSummaryWg sync.WaitGroup
-	cpuSummaryWg.Add(1)
-	go updateCPUSummary(done, &cpuSummaryWg)
-
-	// Create the channel for the messages
-	// Buffer size set to handle worse-case scenario
-	bufferSize := int(math.Ceil(1.5 * numCPU * rate * GENERATE_REQUESTS_INTERVAL.Seconds()))
-	c := make(chan WorkItem, bufferSize)
-	go scheduleWork(rate, c, done)
-
-	// make sure we use all available CPUs
-	runtime.GOMAXPROCS(int(numCPU))
-
-	// Create a WaitGroup to wait for all the workers to finish
-	var wg sync.WaitGroup
-
-	workers := make([]*Worker, int(numCPU))
-
-	// Start the workers
-	for i := 0; i < int(numCPU); i++ {
-		workers[i] = &Worker{histutils.NewHistogram("exponential", 2.0, 1e9)}
-		wg.Add(1)
-		go worker(i, c, &wg, workers[i].workHistogram)
+	file, err := os.OpenFile(filePath, os.O_RDWR, 0666)
+	if err != nil {
+		panic(err)
 	}
+	defer file.Close()
 
-	// Setup signal catching
-	sc := make(chan os.Signal, 1)
-	signal.Notify(sc, os.Interrupt, syscall.SIGTERM)
-
-	// Wait for an interrupt
-	sig := <-sc
-
-	log.Printf("Received signal: %v\n", sig)
-
-	// Tell work generator to stop, it will also close work channel
-	close(done)
-
-	// Wait for all workers to finish
-	log.Printf("Waiting for workers to finish\n")
-	wg.Wait()
-
-	log.Printf("Writing work histogram\n")
-	// write total work histogram to file
-	mtx2.Lock()
-	totalWorkHistogram.WriteToCSV(workHistogramOutputFilenema)
-	mtx2.Unlock()
-
-	log.Printf("Writing CPU Summary worker to finish\n")
-	cpuSummaryWg.Wait()
-
-	log.Printf("Writing CPU Summary histogram\n")
-	totalCPUHistogram.WriteToCSV(cpuHistogramOutputFilenema)
-
-	log.Printf("Compressing csv files\n")
-	files := []string{"total_work_histogram.csv", "total_cpu_histogram.csv", "per_cpu_utilization.csv", "cpu_utilization.csv", "cpu_samples.csv"}
-	err := tarballFiles(files, "files.tar.gz")
+	fileInfo, err := file.Stat()
 	if err != nil {
 		panic(err)
 	}
 
-	// Sleep to allow for CPU profile to be collected
-	log.Printf("Sleeping for %v to allow for CPU profile to be collected\n", finalSleepTime)
-	time.Sleep(finalSleepTime)
+	data, err := syscall.Mmap(int(file.Fd()), 0, int(fileInfo.Size()), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		panic(err)
+	}
+	defer syscall.Munmap(data)
+
+	rand.Seed(time.Now().UnixNano())
+
+	for i := uint64(0); i < math.MaxUint64; i++ {
+		// Random position for modification
+		position := rand.Intn(len(data) - modificationSize)
+		modification := make([]byte, modificationSize)
+		rand.Read(modification)
+
+		// Modify the memory-mapped file
+		copy(data[position:], modification)
+
+		if i%syncEvery == 0 {
+			// Sync changes to the file
+			_, _, errno := syscall.Syscall(syscall.SYS_MSYNC, uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)), syscall.MS_ASYNC)
+			if errno != 0 {
+				panic(errno)
+			}
+		}
+	}
+}
+
+func createLargeFile(filePath string) {
+	file, err := os.Create(filePath)
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+
+	const fileSize = 100 << 30 // 100 GB
+	const bufferSize = 1 << 20 // 1 MB buffer size
+
+	buffer := make([]byte, bufferSize)
+	rand.Seed(time.Now().UnixNano())
+
+	for written := 0; written < fileSize; written += bufferSize {
+		rand.Read(buffer)
+		_, err := file.Write(buffer)
+		if err != nil {
+			panic(err)
+		}
+	}
 }
 
 // // linearRegression function calculates the coefficients of linear regression
