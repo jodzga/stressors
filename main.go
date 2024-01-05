@@ -129,13 +129,30 @@ func main() {
 	if mode == "disk" {
 		fmt.Printf("Disk mode\n")
 
-		testFile := diskPath + "/test_file"
+		// make sure we use all available CPUs
+		runtime.GOMAXPROCS(10)
 
-		createLargeFile(testFile)
+		var wg sync.WaitGroup
 
-		// Memory-map the file
+		// for i := 0; i < 10; i++ {
+		// 	testFile := strings.TrimSuffix(diskPath, "/") + "/test_file_" + strconv.Itoa(i)
+		// 	createLargeFile(testFile)
 
-		modifyMappedFile(testFile)
+		// 	wg.Add(1)
+		// 	go modifyMappedFile(testFile)
+		// }
+
+		for i := 0; i < 512; i++ {
+			testFile := strings.TrimSuffix(diskPath, "/") + "/test_file_" + strconv.Itoa(i)
+
+			wg.Add(1)
+			go createFileLoop(testFile)
+		}
+
+		// testFile := strings.TrimSuffix(diskPath, "/") + "/test_file"
+		// createFileLoop(testFile)
+
+		wg.Wait()
 
 	} else if mode == "cpu" {
 		fmt.Printf("CPU mode\n")
@@ -233,8 +250,23 @@ func main() {
 	}
 }
 
+func createFileLoop(filePath string) {
+	fmt.Printf("Starting createFileLoop\n")
+
+	for {
+		createLargeFile(filePath)
+		// delete the file
+		err := os.Remove(filePath)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
 func modifyMappedFile(filePath string) {
-	const syncEvery = 1000
+	fmt.Printf("Starting modifyMappedFile\n")
+
+	const syncEvery = 40000
 	const modificationSize = 4096 // Size of each modification
 
 	file, err := os.OpenFile(filePath, os.O_RDWR, 0666)
@@ -256,14 +288,20 @@ func modifyMappedFile(filePath string) {
 
 	rand.Seed(time.Now().UnixNano())
 
-	for i := uint64(0); i < math.MaxUint64; i++ {
+	for i := uint64(0); ; i++ {
 		// Random position for modification
 		position := rand.Intn(len(data) - modificationSize)
-		modification := make([]byte, modificationSize)
-		rand.Read(modification)
+		for j := 0; j < modificationSize; j++ {
+			b := data[(position+j)%len(data)]
+			b = b + 1
+			data[(position+j)%len(data)] = b
+		}
 
-		// Modify the memory-mapped file
-		copy(data[position:], modification)
+		// modification := make([]byte, modificationSize)
+		// rand.Read(modification)
+
+		// // Modify the memory-mapped file
+		// copy(data[position:], modification)
 
 		if i%syncEvery == 0 {
 			// Sync changes to the file
@@ -273,17 +311,20 @@ func modifyMappedFile(filePath string) {
 			}
 		}
 	}
+
 }
 
 func createLargeFile(filePath string) {
+
+	fmt.Printf("Creating 100G test file\n")
 	file, err := os.Create(filePath)
 	if err != nil {
 		panic(err)
 	}
 	defer file.Close()
 
-	const fileSize = 100 << 30 // 100 GB
-	const bufferSize = 1 << 20 // 1 MB buffer size
+	const fileSize = 512 * 1024 * 1024 // 100GB
+	const bufferSize = 1 << 20         // 1 MB buffer size
 
 	buffer := make([]byte, bufferSize)
 	rand.Seed(time.Now().UnixNano())
@@ -295,6 +336,8 @@ func createLargeFile(filePath string) {
 			panic(err)
 		}
 	}
+	fmt.Printf("Done creating 100G test file\n")
+
 }
 
 // // linearRegression function calculates the coefficients of linear regression
